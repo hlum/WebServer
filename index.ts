@@ -1,25 +1,92 @@
 import * as net from "net";
+import { type TCPConn, type TCPListener } from "./TCPListener.js";
 
-let server = net.createServer({ pauseOnConnect: true });
-server.listen({ host: "127.0.0.1", port: 1234 });
-server.on("connection", newCon);
-server.on("error", (err: Error) => {
-	throw err;
-});
+main();
 
-async function newCon(socket: net.Socket) {
-	console.log("new connection", socket.remoteAddress, socket.remotePort);
-	try {
-		await serveClient(socket);
-	} catch (error) {
-		console.error("error: ", error);
-	} finally {
-		socket.destroy();
+async function main() {
+	const listener = soListen(8080, "127.0.0.1");
+
+	while (true) {
+		try {
+			const conn = await soAccept(listener);
+			// starts a task to serve the connection; don't await it to accept new connections concurrently.
+			serveClient(conn).catch((err) => {
+				console.error("error serving client: ", err);
+			});
+		} catch (error) {
+			console.error("error accepting connection: ", error);
+			break;
+		}
 	}
 }
 
-async function serveClient(socket: net.Socket) {
-	const conn: TCPConn = soInit(socket);
+function soListen(port: number, host: string): TCPListener {
+	const server = net.createServer({ pauseOnConnect: true });
+
+	const listener: TCPListener = {
+		server,
+		err: null,
+		closed: false,
+		accepter: null,
+	};
+
+	// new Incoming connection
+	server.on("connection", (socket: net.Socket) => {
+		console.assert(listener.accepter !== null, "connection without pending accept");
+		if (!listener.accepter) {
+			socket.destroy();
+			return;
+		}
+
+		const { resolve } = listener.accepter;
+		listener.accepter = null;
+
+		// warp the socket into a TCPConn and resolve the accept promise.
+		const conn = soInit(socket);
+		resolve(conn);
+	});
+
+	// server error
+	server.on("error", (err) => {
+		listener.err = err;
+		if (listener.accepter) {
+			listener.accepter.reject(err);
+			listener.accepter = null;
+		}
+	});
+
+	// server closed
+	server.on("close", () => {
+		listener.closed = true;
+		if (listener.accepter) {
+			listener.accepter.reject(new Error("server closed"));
+			listener.accepter = null;
+		}
+	});
+
+	server.listen({ host, port });
+
+	return listener;
+}
+
+function soAccept(listener: TCPListener): Promise<TCPConn> {
+	return new Promise((resolve, reject) => {
+		// fail fast if the server is already closed or has error.
+		if (listener.closed) {
+			reject(new Error("server closed"));
+			return;
+		}
+
+		if (listener.err) {
+			reject(listener.err);
+			return;
+		}
+
+		listener.accepter = { resolve, reject };
+	});
+}
+
+async function serveClient(conn: TCPConn) {
 	while (true) {
 		const data = await soRead(conn);
 		if (data.length === 0) {
@@ -34,21 +101,6 @@ async function serveClient(socket: net.Socket) {
 		await soWrite(conn, data);
 	}
 }
-
-// A promise-based API for TCP sockets.
-type TCPConn = {
-	// the js socked object
-	socket: net.Socket;
-	// error event
-	err: null | Error;
-	// EOF, from the end event
-	ended: boolean;
-	// callbacks of the promise of the current read
-	reader: null | {
-		resolve: (value: Buffer) => void;
-		reject: (reason: Error) => void;
-	};
-};
 
 // create wrapper from net.Socket to TCPConn
 function soInit(socket: net.Socket): TCPConn {
